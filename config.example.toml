@@ -1,0 +1,11 @@
+# Do not put credentials, login state, or real payload data in this file.
+
+[yxer]
+executable = "yxer.cmd"
+
+[publication]
+platform = "小红书"
+content_type = "imageText"
+payload = "payloads/xiaohongshu-post.json"
+channel = "cloud"
+# client_id = "" # Required only for the local channel.

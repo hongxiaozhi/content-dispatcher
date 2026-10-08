@@ -1,0 +1,12 @@
+# Local runtime data: never commit these files.
+.state/
+.venv/
+config.toml
+payloads/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
