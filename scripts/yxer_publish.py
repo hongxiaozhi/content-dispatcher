@@ -6,14 +6,42 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
-import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 and earlier, including macOS system Python.
+    tomllib = None  # type: ignore[assignment]
+
 
 class ConfigurationError(ValueError):
     """The public TOML configuration is incomplete or inconsistent."""
+
+
+def parse_minimal_toml(text: str) -> dict[str, dict[str, str]]:
+    """Read this project's deliberately small TOML configuration subset.
+
+    The public config only needs sections and quoted scalar values. Keeping this
+    fallback local avoids adding a runtime dependency solely for Python 3.9.
+    """
+    result: dict[str, dict[str, str]] = {}
+    current: dict[str, str] | None = None
+    for number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = result.setdefault(line[1:-1].strip(), {})
+            continue
+        if current is None or "=" not in line:
+            raise ConfigurationError(f"TOML 格式错误（第 {number} 行）。")
+        key, value = (part.strip() for part in line.split("=", 1))
+        if not key or not (value.startswith('"') and value.endswith('"')):
+            raise ConfigurationError(f"TOML 只支持带引号的字符串值（第 {number} 行）。")
+        current[key] = value[1:-1]
+    return result
 
 
 @dataclass(frozen=True)
@@ -29,10 +57,12 @@ class PublicationConfig:
 def load_config(config_path: Path) -> PublicationConfig:
     """Load public configuration without opening the payload or credentials."""
     try:
-        raw = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        source = config_path.read_text(encoding="utf-8")
     except FileNotFoundError as error:
         raise ConfigurationError(f"找不到配置文件：{config_path}") from error
-    except tomllib.TOMLDecodeError as error:
+    try:
+        raw = tomllib.loads(source) if tomllib is not None else parse_minimal_toml(source)
+    except Exception as error:
         raise ConfigurationError(f"TOML 格式错误：{error}") from error
 
     yxer = raw.get("yxer")
