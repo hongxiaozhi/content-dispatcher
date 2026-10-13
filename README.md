@@ -4,7 +4,47 @@
 
 ## Markdown 图文编译
 
-`scripts/compile_markdown.py` 读取文章标题、`## 封面`、正文中的 Markdown 图片和简单 front matter。它会将 SVG 转为 PNG，保持正文图片的原始插入位置，并输出审核结果、素材清单、可直接在浏览器打开的 `preview.html` 和平台 payload。
+`scripts/compile_markdown.py` 只读取新版双正文 Markdown：顶层元数据、`full`/`short` 正文标记及平台媒体配置。它会将 SVG 转为 PNG，保持完整正文图片的原始插入位置，并输出审核结果、素材清单、可直接在浏览器打开的 `preview.html` 和平台 payload。
+
+### 一篇 Markdown，多个平台
+
+Markdown 是唯一内容源：顶层保存完整主标题、共享摘要、关键词和话题；正文只有 `full` 与由其忠实浓缩的 `short` 两个版本。`platforms` 只保存封面、卡片、裁切、通知等媒体配置。小红书可显式配置同主题的精简标题；标题超出平台限制时脚本会报错，绝不截断。
+
+```yaml
+---
+title: "完整主标题不受小红书长度限制"
+summary: "唯一的共享摘要来源。"
+keywords:
+  - 计算化学
+hashtags:
+  - 分子对接
+
+platforms:
+  wechat:
+    notify_subscribers: false
+    cover: "assets/03-wechat-cover.svg"
+  xiaohongshu:
+    title: "小红书短标题"
+    cover: "assets/03-xhs-cover.svg"
+    images:
+      - assets/03-xhs-cover.svg
+      - assets/03-xhs-card-01.svg
+---
+
+<!-- content:full:start -->
+
+公众号使用的完整技术教程。
+
+<!-- content:full:end -->
+
+<!-- content:short:start -->
+
+小红书使用的忠实简化正文。
+
+<!-- content:short:end -->
+```
+
+微信公众号使用顶层 `title`、`summary` 和 `full`；小红书使用 `short`、顶层 `hashtags`，以及 `xiaohongshu.title`（如配置，否则使用顶层 `title`）。当小红书声明 `images` 时，编译器只使用这组卡片，不会把完整正文插图混入图文列表。旧 Markdown 格式会被正式解析器拒绝；一次性迁移请使用 `scripts/migrate_dual_content.py --write <文章路径>`。
 
 预览结构由脚本统一生成，避免不同平台或文章漏图；颜色、品牌名、字体色和内容区宽度则放在 [`themes/default.json`](themes/default.json)。复制并修改该 JSON 后，可通过 `--theme <文件路径>` 切换预览风格，内容与发布逻辑不会受到影响。
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -18,14 +19,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from svg_to_png import ConversionError, convert_svg
+from svg_to_png import ConversionError, convert_svg, crop_svg_to_wechat_cover
 
 
 IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 LIST_RE = re.compile(r"^\s*(?:[-*+] |\d+[.)] )(.+)$")
 HASHTAG_LINE_RE = re.compile(r"^\s*(?:#[^\s#]+\s*)+$")
+CONTENT_BLOCK_RE = re.compile(
+    r"<!--\s*content:(full|short):(start|end)\s*-->", re.IGNORECASE
+)
 DEFAULT_THEME_PATH = Path(__file__).resolve().parents[1] / "themes" / "default.json"
+DEFAULT_YXER_EXECUTABLE = "yxer.cmd" if os.name == "nt" else "yxer"
 
 
 class CompileError(ValueError):
@@ -39,6 +44,7 @@ class Asset:
     source: Path
     generated: Path | None = None
     resource: dict[str, Any] | None = None
+    wechat_crop_y: int | None = None
 
 
 @dataclass
@@ -46,10 +52,39 @@ class Article:
     source: Path
     title: str
     body: str
+    summary: str
     tags: list[str]
     assets: list[Asset]
     cover: Asset
+    platform: dict[str, Any] = field(default_factory=dict)
     inline_references: list[str] = field(default_factory=list)
+
+
+def parse_scalar(value: str) -> Any:
+    """Parse the small scalar/list YAML subset used by content source files."""
+    value = value.strip()
+    if value.startswith("[") and value.endswith("]"):
+        return [item.strip().strip('"').strip("'") for item in value[1:-1].split(",") if item.strip()]
+    return value.strip('"').strip("'")
+
+
+def extract_content_variants(text: str) -> tuple[str | None, str | None]:
+    """Return the validated full/short bodies, or ``(None, None)`` for legacy Markdown."""
+    matches = list(CONTENT_BLOCK_RE.finditer(text))
+    if not matches:
+        return None, None
+    expected = [("full", "start"), ("full", "end"), ("short", "start"), ("short", "end")]
+    actual = [(match.group(1).lower(), match.group(2).lower()) for match in matches]
+    if actual != expected:
+        raise CompileError("正文标记必须按 full:start、full:end、short:start、short:end 各出现一次。")
+    outside = (text[:matches[0].start()] + text[matches[1].end():matches[2].start()] + text[matches[3].end():]).strip()
+    if outside:
+        raise CompileError("双正文标记外只能保留空白；请把正文放入 full 或 short 区。")
+    full = text[matches[0].end():matches[1].start()].strip()
+    short = text[matches[2].end():matches[3].start()].strip()
+    if not full or not short:
+        raise CompileError("full 与 short 正文都不能为空。")
+    return full, short
 
 
 def parse_simple_front_matter(text: str) -> tuple[dict[str, Any], str]:
@@ -74,6 +109,42 @@ def parse_simple_front_matter(text: str) -> tuple[dict[str, Any], str]:
             index += 1
             continue
         key, value = match.groups()
+        if key == "platforms" and not value:
+            index += 1
+            platforms: dict[str, dict[str, Any]] = {}
+            while index < end and lines[index].startswith("  "):
+                platform_match = re.match(r"^  ([A-Za-z_][\w-]*):\s*$", lines[index])
+                if not platform_match:
+                    raise CompileError(f"platforms 格式错误（第 {index + 1} 行）。")
+                platform_name = platform_match.group(1)
+                index += 1
+                options: dict[str, Any] = {}
+                while index < end and lines[index].startswith("    "):
+                    option_match = re.match(r"^    ([A-Za-z_][\w-]*):\s*(.*)$", lines[index])
+                    if not option_match:
+                        raise CompileError(f"平台配置格式错误（第 {index + 1} 行）。")
+                    option, option_value = option_match.groups()
+                    if option_value == "|":
+                        index += 1
+                        values: list[str] = []
+                        while index < end and (lines[index].startswith("      ") or not lines[index].strip()):
+                            values.append(lines[index][6:] if lines[index].startswith("      ") else "")
+                            index += 1
+                        options[option] = "\n".join(values).strip()
+                        continue
+                    if option_value:
+                        options[option] = parse_scalar(option_value)
+                        index += 1
+                        continue
+                    index += 1
+                    values: list[str] = []
+                    while index < end and re.match(r"^      -\s+", lines[index]):
+                        values.append(re.sub(r"^      -\s+", "", lines[index]).strip().strip('"'))
+                        index += 1
+                    options[option] = values
+                platforms[platform_name] = options
+            metadata[key] = platforms
+            continue
         if value == "|":
             index += 1
             values: list[str] = []
@@ -90,7 +161,7 @@ def parse_simple_front_matter(text: str) -> tuple[dict[str, Any], str]:
                 index += 1
             metadata[key] = values
             continue
-        metadata[key] = value.strip().strip('"').strip("'")
+        metadata[key] = parse_scalar(value)
         index += 1
     return metadata, "\n".join(lines[end + 1:]).strip()
 
@@ -160,37 +231,58 @@ def resolve_asset(article_path: Path, reference: str) -> Path:
     return candidate
 
 
-def parse_article(article_path: Path) -> Article:
+def parse_article(article_path: Path, target: str | None = None) -> Article:
     source = article_path.resolve()
     if not source.is_file():
         raise CompileError(f"找不到 Markdown：{source}")
     metadata, remaining = parse_simple_front_matter(source.read_text(encoding="utf-8"))
-    body = str(metadata.get("body") or remaining).strip()
-    title = str(metadata.get("title") or find_heading_title(remaining) or "").strip()
+    platforms = metadata.get("platforms") if isinstance(metadata.get("platforms"), dict) else {}
+    platform = platforms.get(target, {}) if target else {}
+    if not isinstance(platform, dict):
+        raise CompileError(f"platforms.{target} 必须是对象。")
+    full_body, short_body = extract_content_variants(remaining)
+    if full_body is None:
+        raise CompileError("文章必须使用 content:full 与 content:short 正文标记；请先运行迁移工具。")
+    body = short_body if target == "xiaohongshu" else full_body
+    main_title = str(metadata.get("title") or "").strip()
+    title = str(platform.get("title") or main_title) if target == "xiaohongshu" else main_title
     if not title:
         raise CompileError("文章必须包含 title 或一级标题")
 
-    declared_images = metadata.get("images") if isinstance(metadata.get("images"), list) else []
+    declared_images = platform.get("images") if isinstance(platform.get("images"), list) else metadata.get("images") if isinstance(metadata.get("images"), list) else []
     all_refs: list[tuple[str, str]] = []
     for ref in declared_images:
         all_refs.append(("", str(ref)))
-    all_refs.extend(image_refs(remaining))
-    all_refs.extend(image_refs(body))
+    if not (target == "xiaohongshu" and isinstance(platform.get("images"), list)):
+        all_refs.extend(image_refs(full_body))
+    configured_cover = platform.get("cover")
+    if isinstance(configured_cover, str) and configured_cover.strip() and not any(ref == configured_cover.strip() for _, ref in all_refs):
+        all_refs.insert(0, ("", configured_cover.strip()))
     deduplicated: list[tuple[str, str]] = []
     seen: set[str] = set()
     for alt, ref in all_refs:
         if ref not in seen:
             deduplicated.append((alt, ref))
             seen.add(ref)
+        elif alt:
+            for index, (known_alt, known_ref) in enumerate(deduplicated):
+                if known_ref == ref and not known_alt:
+                    deduplicated[index] = (alt, ref)
+                    break
     if not deduplicated:
         raise CompileError("文章没有图片。图文发布至少需要一张封面图。")
 
-    cover_ref = cover_ref_from_section(remaining) or str(declared_images[0] if declared_images else deduplicated[0][1])
+    cover_ref = str(configured_cover or cover_ref_from_section(remaining) or (declared_images[0] if declared_images else deduplicated[0][1]))
     assets = [Asset(reference=ref, alt=alt, source=resolve_asset(source, ref)) for alt, ref in deduplicated]
     asset_by_ref = {asset.reference: asset for asset in assets}
     if cover_ref not in asset_by_ref:
         raise CompileError(f"封面未出现在图片清单中：{cover_ref}")
     cover = asset_by_ref[cover_ref]
+    if target == "wechat" and platform.get("cover_crop_y") not in (None, ""):
+        try:
+            cover.wechat_crop_y = int(platform["cover_crop_y"])
+        except (TypeError, ValueError) as error:
+            raise CompileError("platforms.wechat.cover_crop_y 必须是整数。") from error
     ordered = [cover, *(asset for asset in assets if asset is not cover)]
     body = without_cover_block(body, cover_ref)
     body = re.sub(r"^#\s+.+?$", "", body, count=1, flags=re.MULTILINE).strip()
@@ -198,8 +290,11 @@ def parse_article(article_path: Path) -> Article:
     if not tags:
         tags = [tag for line in body.splitlines() if HASHTAG_LINE_RE.match(line) for tag in re.findall(r"#([^\s#]+)", line)]
     body = "\n".join(line for line in body.splitlines() if not HASHTAG_LINE_RE.match(line)).strip()
-    return Article(source=source, title=title, body=body, tags=[str(tag).lstrip("#") for tag in tags], assets=ordered, cover=cover,
-                   inline_references=[ref for _, ref in image_refs(body)])
+    summary = str(metadata.get("summary") or "").strip()
+    if not summary:
+        raise CompileError("文章必须包含共享 summary。")
+    return Article(source=source, title=title, body=body, summary=summary, tags=[str(tag).lstrip("#") for tag in tags],
+                   assets=ordered, cover=cover, platform=platform, inline_references=[ref for _, ref in image_refs(body)])
 
 
 def materialize_assets(article: Article, output_dir: Path) -> None:
@@ -208,7 +303,10 @@ def materialize_assets(article: Article, output_dir: Path) -> None:
         suffix = ".png" if asset.source.suffix.lower() == ".svg" else asset.source.suffix.lower()
         target = asset_dir / f"{index:02d}-{asset.source.stem}{suffix}"
         if asset.source.suffix.lower() == ".svg":
-            convert_svg(asset.source, target)
+            if asset.wechat_crop_y is not None:
+                crop_svg_to_wechat_cover(asset.source, target, asset.wechat_crop_y)
+            else:
+                convert_svg(asset.source, target)
         else:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(asset.source, target)
@@ -244,7 +342,7 @@ def render_inline(text: str, image_html: dict[str, str]) -> str:
     return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", rendered)
 
 
-def markdown_to_html(article: Article, image_html: dict[str, str]) -> str:
+def markdown_to_html(article: Article, image_html: dict[str, str], platform: str = "") -> str:
     blocks: list[str] = []
     paragraph: list[str] = []
     list_items: list[str] = []
@@ -252,13 +350,15 @@ def markdown_to_html(article: Article, image_html: dict[str, str]) -> str:
     def flush_paragraph() -> None:
         nonlocal paragraph
         if paragraph:
-            blocks.append(f"<p>{render_inline(' '.join(paragraph), image_html)}</p>")
+            style = ' style="margin:0 0 18px;line-height:1.85;color:#243746;"' if platform == "wechat" else ""
+            blocks.append(f"<p{style}>{render_inline(' '.join(paragraph), image_html)}</p>")
             paragraph = []
 
     def flush_list() -> None:
         nonlocal list_items
         if list_items:
-            blocks.append("<ol>" + "".join(f"<li>{render_inline(item, image_html)}</li>" for item in list_items) + "</ol>")
+            style = ' style="margin:0 0 18px;padding-left:1.5em;line-height:1.85;color:#243746;"' if platform == "wechat" else ""
+            blocks.append(f"<ol{style}>" + "".join(f"<li>{render_inline(item, image_html)}</li>" for item in list_items) + "</ol>")
             list_items = []
 
     for raw_line in article.body.splitlines():
@@ -280,8 +380,12 @@ def markdown_to_html(article: Article, image_html: dict[str, str]) -> str:
             flush_paragraph()
             flush_list()
             level, value = heading.groups()
-            level_number = min(len(level) + 1, 4)
-            blocks.append(f"<h{level_number}>{render_inline(value, image_html)}</h{level_number}>")
+            # The document title is already rendered as <h1> by the preview.
+            # Authors therefore use Markdown ``##`` for ordinary article sections.
+            level_number = min(len(level), 4)
+            style = (' style="margin:34px 0 15px;padding-left:12px;border-left:4px solid #426B88;'
+                     'font-size:20px;line-height:1.45;color:#243746;"') if platform == "wechat" and level_number == 2 else ""
+            blocks.append(f"<h{level_number}{style}>{render_inline(value, image_html)}</h{level_number}>")
             continue
         item = LIST_RE.match(line)
         if item:
@@ -302,10 +406,32 @@ def plain_text(article: Article) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+def wechat_digest(article: Article) -> str:
+    """Return a one-line WeChat digest within the platform's 120-character limit."""
+    source = article.platform.get("digest") or article.summary or plain_text(article)
+    return re.sub(r"\s+", " ", str(source)).strip()[:120]
+
+
 def uploaded_image(asset: Asset) -> dict[str, Any]:
     if asset.resource is None:
         raise CompileError("生成发布 payload 前必须上传所有图片；请添加 --upload。")
     return dict(asset.resource)
+
+
+def format_xiaohongshu_description(text: str) -> str:
+    """Turn blank-line paragraphs and Markdown bold into conservative HTML."""
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+    rendered: list[str] = []
+    for paragraph in paragraphs:
+        safe = html.escape(paragraph)
+        safe = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", safe)
+        rendered.append(f"<p>{safe.replace(chr(10), '<br />')}</p>")
+    return "".join(rendered)
+
+
+def xiaohongshu_description(article: Article) -> str:
+    """Return the exact HTML description used by the XHS payload before tags."""
+    return format_xiaohongshu_description(plain_text(article).strip())
 
 
 def make_xiaohongshu_payload(article: Article, account_id: str) -> dict[str, Any]:
@@ -314,9 +440,12 @@ def make_xiaohongshu_payload(article: Article, account_id: str) -> dict[str, Any
     if len(article.title) > 20:
         raise CompileError("小红书标题超过 20 个字符，请在 Markdown 中使用更短标题。")
     images = [uploaded_image(asset) for asset in article.assets]
-    description = plain_text(article)
+    # Long-form Markdown may exceed a Xiaohongshu note's 1,000-character
+    # description limit.  A platform-specific summary keeps one source file
+    # while letting its card images carry the detailed tutorial.
+    description = xiaohongshu_description(article)
     if article.tags:
-        description = f"{description}\n\n" + " ".join(f"#{tag}" for tag in article.tags)
+        description += "<p>" + " ".join(f"#{tag}" for tag in article.tags) + "</p>"
     if len(description) > 1000:
         raise CompileError("小红书正文超过 1000 个字符，请压缩内容。")
     return {
@@ -333,18 +462,19 @@ def make_wechat_payload(article: Article, account_id: str, resource_url_template
         asset.reference: f'<p><img src="{html.escape(resource_url_template.format(key=uploaded_image(asset)["key"]), quote=True)}" alt="{html.escape(asset.alt, quote=True)}" /></p>'
         for asset in article.assets if asset is not article.cover
     }
-    content = markdown_to_html(article, image_html)
+    content = markdown_to_html(article, image_html, "wechat")
     for asset in article.assets[1:]:
         if asset.reference not in article.inline_references:
             content += "\n" + image_html[asset.reference]
     cover = uploaded_image(article.cover)
+    notify = 1 if str(article.platform.get("notify_subscribers", "false")).lower() in {"1", "true", "yes"} else 0
     return {
         "action": "publish", "publishType": "article", "platforms": ["微信公众号"], "publishChannel": "cloud",
         "desc": plain_text(article)[:120],
         "publishArgs": {"accountForms": [{"platformAccountId": account_id, "platformName": "微信公众号"}], "platformForms": {"微信公众号": {
-            "articles": [{"title": article.title, "content": content, "digest": plain_text(article)[:129], "type": 0,
+            "articles": [{"title": article.title, "content": content, "digest": wechat_digest(article), "type": 0,
                           "cover": {"key": cover["key"], "raw": {}}}],
-            "notifySubscribers": 0, "pubType": 1,
+            "notifySubscribers": notify, "pubType": 1,
         }}},
     }
 
@@ -386,7 +516,7 @@ def local_asset_url(asset: Asset, output_dir: Path) -> str:
     return quote(asset.generated.relative_to(output_dir).as_posix())
 
 
-def write_preview(article: Article, output_dir: Path, review_result: dict[str, Any], theme: dict[str, str]) -> None:
+def write_preview(article: Article, output_dir: Path, review_result: dict[str, Any], theme: dict[str, str], target: str = "wechat") -> None:
     """Generate a self-contained, review-only HTML preview from converted assets."""
     image_html = {
         asset.reference: (
@@ -395,10 +525,18 @@ def write_preview(article: Article, output_dir: Path, review_result: dict[str, A
         ) % (html.escape(local_asset_url(asset, output_dir), quote=True), html.escape(asset.alt, quote=True), html.escape(asset.alt))
         for asset in article.assets if asset is not article.cover
     }
-    body = markdown_to_html(article, image_html)
-    for asset in article.assets[1:]:
-        if asset.reference not in article.inline_references:
-            body += "\n" + image_html[asset.reference]
+    if target == "xiaohongshu":
+        body = xiaohongshu_description(article)
+        if article.tags:
+            body += "<p>" + " ".join(f"#{html.escape(tag)}" for tag in article.tags) + "</p>"
+        body += "\n" + "\n".join(
+            image_html[asset.reference] for asset in article.assets if asset is not article.cover
+        )
+    else:
+        body = markdown_to_html(article, image_html, "wechat")
+        for asset in article.assets[1:]:
+            if asset.reference not in article.inline_references:
+                body += "\n" + image_html[asset.reference]
     warnings = "".join(f"<li>{html.escape(item)}</li>" for item in review_result["warnings"])
     warning_block = f'<aside class="review"><strong>审核提示</strong><ul>{warnings}</ul></aside>' if warnings else ""
     css = """
@@ -437,18 +575,18 @@ def main() -> int:
     parser.add_argument("--account-id", help="目标平台账号 ID；生成 payload 时必填")
     parser.add_argument("--output-dir", type=Path, default=Path("build/content"))
     parser.add_argument("--upload", action="store_true", help="转换后通过 yxer upload 上传图片")
-    parser.add_argument("--yxer", default="yxer", help="yxer 可执行文件路径")
+    parser.add_argument("--yxer", default=DEFAULT_YXER_EXECUTABLE, help="yxer 可执行文件路径")
     parser.add_argument("--theme", type=Path, help="预览主题 JSON；默认使用 themes/default.json")
     parser.add_argument("--resource-url-template", default="https://oss-v2.yixiaoer.cn/{key}",
                         help="公众号正文内图的内部资源 URL 模板")
     args = parser.parse_args()
     try:
-        article = parse_article(args.article)
+        article = parse_article(args.article, args.target)
         output_dir = args.output_dir.resolve()
         materialize_assets(article, output_dir)
         review_result = review(article)
         write_json(output_dir / "review.json", review_result)
-        write_preview(article, output_dir, review_result, load_theme(args.theme))
+        write_preview(article, output_dir, review_result, load_theme(args.theme), args.target)
         if args.upload:
             if not args.account_id:
                 raise CompileError("使用 --upload 生成发布 payload 时必须提供 --account-id。")
