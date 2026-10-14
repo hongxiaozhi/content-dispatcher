@@ -452,7 +452,8 @@ def make_xiaohongshu_payload(article: Article, account_id: str) -> dict[str, Any
         "action": "publish", "publishType": "imageText", "platforms": ["小红书"], "publishChannel": "cloud",
         "publishArgs": {"accountForms": [{
             "platformAccountId": account_id, "cover": images[0], "coverKey": images[0]["key"], "images": images,
-            "contentPublishForm": {"formType": "task", "title": article.title, "description": description, "visibleType": 0},
+            "contentPublishForm": {"formType": "task", "title": article.title, "description": description,
+                                   "images": images, "visibleType": 0},
         }]},
     }
 
@@ -483,7 +484,8 @@ def review(article: Article) -> dict[str, Any]:
     warnings: list[str] = []
     if len(article.assets) == 1:
         warnings.append("文章只有封面，没有正文图片。")
-    if not article.inline_references and len(article.assets) > 1:
+    if (not article.inline_references and len(article.assets) > 1
+            and not isinstance(article.platform.get("images"), list)):
         warnings.append("正文没有内嵌图片标记；非封面图片会追加到文章末尾。")
     if re.search(r"评论区|留一个关键词|关注我|点个赞|私信", article.body):
         warnings.append("检测到互动话术；教程稿发布前建议人工确认是否删除。")
