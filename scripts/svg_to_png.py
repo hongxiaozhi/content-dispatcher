@@ -130,9 +130,24 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="将一张 SVG 素材转换为 PNG。")
     parser.add_argument("source", type=Path, help="输入 SVG")
     parser.add_argument("target", type=Path, help="输出 PNG")
+    parser.add_argument(
+        "--wechat-cover",
+        action="store_true",
+        help="从 1080px 宽 SVG 的指定安全区裁出 900×383 公众号横版封面。",
+    )
+    parser.add_argument(
+        "--crop-y",
+        type=int,
+        default=0,
+        help="公众号横幅在源 SVG 中的裁切起始 y 坐标（默认：0）。",
+    )
     args = parser.parse_args()
     try:
-        result = convert_svg(args.source, args.target)
+        result = (
+            crop_svg_to_wechat_cover(args.source, args.target, args.crop_y)
+            if args.wechat_cover
+            else convert_svg(args.source, args.target)
+        )
     except ConversionError as error:
         parser.error(str(error))
     print(result)

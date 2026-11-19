@@ -313,6 +313,22 @@ def materialize_assets(article: Article, output_dir: Path) -> None:
         asset.generated = target
 
 
+def reuse_materialized_assets(article: Article, output_dir: Path) -> None:
+    """Attach a previously generated local asset set after verifying every file.
+
+    This is useful when a platform build is resumed after a browser renderer
+    interruption.  It never guesses resources: the expected deterministic
+    filenames must already exist under the requested output directory.
+    """
+    asset_dir = output_dir / "assets"
+    for index, asset in enumerate(article.assets, start=1):
+        suffix = ".png" if asset.source.suffix.lower() == ".svg" else asset.source.suffix.lower()
+        target = asset_dir / f"{index:02d}-{asset.source.stem}{suffix}"
+        if not target.is_file() or target.stat().st_size == 0:
+            raise CompileError(f"不能复用缺失或空的转换素材：{target}")
+        asset.generated = target
+
+
 def upload_asset(asset: Asset, executable: str) -> None:
     assert asset.generated is not None
     result = subprocess.run([executable, "upload", "--file", str(asset.generated), "--json"], check=False,
@@ -339,6 +355,15 @@ def render_inline(text: str, image_html: dict[str, str]) -> str:
         cursor = match.end()
     parts.append(html.escape(text[cursor:]))
     rendered = "".join(parts)
+    # The source remains Markdown, while the WeChat payload is HTML.  Render
+    # the small inline subset used by the articles explicitly; otherwise
+    # readers see literal backticks and Markdown link brackets in production.
+    rendered = re.sub(r"`([^`]+)`", r"<code>\1</code>", rendered)
+    rendered = re.sub(
+        r"\[([^\]]+)\]\((https?://[^\s)]+)\)",
+        r'<a href="\2">\1</a>',
+        rendered,
+    )
     return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", rendered)
 
 
@@ -577,6 +602,8 @@ def main() -> int:
     parser.add_argument("--account-id", help="目标平台账号 ID；生成 payload 时必填")
     parser.add_argument("--output-dir", type=Path, default=Path("build/content"))
     parser.add_argument("--upload", action="store_true", help="转换后通过 yxer upload 上传图片")
+    parser.add_argument("--reuse-assets", action="store_true",
+                        help="复用 output-dir/assets 内已完成且可验证的转换素材。")
     parser.add_argument("--yxer", default=DEFAULT_YXER_EXECUTABLE, help="yxer 可执行文件路径")
     parser.add_argument("--theme", type=Path, help="预览主题 JSON；默认使用 themes/default.json")
     parser.add_argument("--resource-url-template", default="https://oss-v2.yixiaoer.cn/{key}",
@@ -585,7 +612,10 @@ def main() -> int:
     try:
         article = parse_article(args.article, args.target)
         output_dir = args.output_dir.resolve()
-        materialize_assets(article, output_dir)
+        if args.reuse_assets:
+            reuse_materialized_assets(article, output_dir)
+        else:
+            materialize_assets(article, output_dir)
         review_result = review(article)
         write_json(output_dir / "review.json", review_result)
         write_preview(article, output_dir, review_result, load_theme(args.theme), args.target)

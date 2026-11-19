@@ -61,6 +61,16 @@ platforms:
             self.assertIn("https://assets.example/asset-1.png", content)
             self.assertIn("alt=\"正文图\"", content)
 
+    def test_wechat_html_renders_inline_code_and_links(self) -> None:
+        article = compiler.Article(
+            source=Path("post.md"), title="标题", body="使用 `tool`，见 [官方文档](https://example.test/docs)。",
+            summary="摘要", tags=[], assets=[], cover=compiler.Asset("", "", Path("cover.png")),
+        )
+        rendered = compiler.markdown_to_html(article, {}, "wechat")
+        self.assertIn("<code>tool</code>", rendered)
+        self.assertIn('<a href="https://example.test/docs">官方文档</a>', rendered)
+        self.assertNotIn("`tool`", rendered)
+
     def test_wechat_digest_is_a_single_line_within_platform_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
